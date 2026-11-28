@@ -45,13 +45,22 @@ def missing_tag_output(tag_name: str) -> dict[str, Any]:
     }
 
 
-def _signature_details(result: Any) -> dict[str, Any]:
-    """Build the signature detail block."""
-    return {
+def _signature_details(result: Any, gpg_key_details: bool) -> dict[str, Any]:
+    """Build the signature detail block.
+
+    The GPG key fields appear only when ``gpg_key_details`` is set, so the
+    block keeps its earlier shape for callers that did not ask for them.
+    """
+    details = {
         "signer_email": result.signature_info.signer_email,
         "key_id": result.signature_info.key_id,
         "fingerprint": result.signature_info.fingerprint,
     }
+    if gpg_key_details:
+        details["primary_fingerprint"] = result.signature_info.primary_fingerprint
+        details["key_source"] = result.signature_info.key_source
+        details["key_expired"] = result.signature_info.key_expired
+    return details
 
 
 def _version_details(result: Any) -> dict[str, Any]:
@@ -129,14 +138,14 @@ def _tail_output(result: Any) -> dict[str, Any]:
     }
 
 
-def build_console_output(result: Any) -> dict[str, Any]:
+def build_console_output(result: Any, gpg_key_details: bool = False) -> dict[str, Any]:
     """Build the JSON payload printed to the console."""
     output = _common_output(result)
     output.update(_tail_output(result))
 
     # Add signature details if available
     if result.signature_info:
-        output["signature_details"] = _signature_details(result)
+        output["signature_details"] = _signature_details(result, gpg_key_details)
 
     # Add version details if available
     if result.version_info:
@@ -160,7 +169,7 @@ def build_console_output(result: Any) -> dict[str, Any]:
     return output
 
 
-def build_file_output(result: Any) -> dict[str, Any]:
+def build_file_output(result: Any, gpg_key_details: bool = False) -> dict[str, Any]:
     """Build the JSON payload written to ``--json-file``."""
     output = _common_output(result)
     output["key_registered"] = (
@@ -170,7 +179,7 @@ def build_file_output(result: Any) -> dict[str, Any]:
 
     # Add signature details if available
     if result.signature_info:
-        output["signature_details"] = _signature_details(result)
+        output["signature_details"] = _signature_details(result, gpg_key_details)
 
     # Add version details if available
     if result.version_info:

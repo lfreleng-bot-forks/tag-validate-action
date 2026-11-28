@@ -10,10 +10,12 @@ git_ops module for secure execution.
 """
 
 import logging
+import os
 from pathlib import Path
 
 from dependamerge.git_ops import run_git
 
+from .gpg_trust import gpg_executable, temporary_keyring
 from .models import SignatureInfo
 from .signature_gpg import GpgSignatureMixin
 from .signature_ssh import SshSignatureMixin, fingerprint_from_ssh_signature
@@ -59,7 +61,13 @@ class SignatureDetector(GpgSignatureMixin, SshSignatureMixin):
         if not self.repo_path.is_dir():
             raise ValueError(f"Repository path does not exist: {repo_path}")
 
-    async def detect_signature(self, tag_name: str) -> SignatureInfo:
+    async def detect_signature(
+        self,
+        tag_name: str,
+        *,
+        trusted_gpg_keys: str | Path | None = None,
+        permit_expired_key: bool = False,
+    ) -> SignatureInfo:
         """
         Detect and parse the signature on a Git tag.
 
@@ -71,6 +79,11 @@ class SignatureDetector(GpgSignatureMixin, SshSignatureMixin):
 
         Args:
             tag_name: Name of the tag to verify
+            trusted_gpg_keys: File of public keys; when set, GPG
+                signatures are verified against these keys only, in a
+                temporary keyring, and the default keyring is not used
+            permit_expired_key: Count a good signature made before its
+                key expired as verified
 
         Returns:
             SignatureInfo object with signature details
@@ -81,71 +94,104 @@ class SignatureDetector(GpgSignatureMixin, SshSignatureMixin):
         logger.debug(f"Detecting signature on tag: {tag_name}")
 
         try:
-            # Run git verify-tag to check signature
-            result = run_git(
-                ["git", "verify-tag", "--raw", tag_name],
-                cwd=self.repo_path,
-                check=False,  # Don't raise on non-zero exit (unsigned tags)
-            )
-
-            # Git writes signature info to stderr
-            verify_output = result.stderr
-
-            # Check if tag has a signature
-            if not verify_output or "no signature found" in verify_output.lower():
-                logger.debug(f"Tag {tag_name} is unsigned")
-                return SignatureInfo(
-                    type="unsigned",
-                    verified=False,
+            if trusted_gpg_keys is None:
+                return await self._detect_signature_with_home(
+                    tag_name,
+                    self._default_home() if permit_expired_key else None,
+                    permit_expired_key,
+                    "keyring",
                 )
-
-            # Check for SSH signature configuration error
-            if "gpg.ssh.allowedSignersFile needs to be configured" in verify_output:
-                logger.debug(
-                    "SSH signature detected but allowedSignersFile not configured"
+            with temporary_keyring(Path(trusted_gpg_keys)) as gnupg_home:
+                return await self._detect_signature_with_home(
+                    tag_name, gnupg_home, permit_expired_key, "supplied"
                 )
-                # Still try to parse SSH signature from tag object
-                return await self._parse_ssh_signature(tag_name, verify_output)
-
-            # Detect signature type
-            if "BADSIG" in verify_output:
-                # Invalid/corrupted GPG signature
-                return await self._parse_invalid_gpg_signature(tag_name, verify_output)
-            elif "ERRSIG" in verify_output:
-                # GPG signature exists but key not available for verification
-                return await self._parse_unverifiable_gpg_signature(
-                    tag_name, verify_output
-                )
-            elif (
-                "GOODSIG" in verify_output
-                or "using RSA key" in verify_output
-                or "using DSA key" in verify_output
-                or "using ECDSA key" in verify_output
-                or "using EdDSA key" in verify_output
-            ):
-                # Valid GPG signature
-                return await self._parse_gpg_signature(tag_name, verify_output)
-            elif (
-                self.SSH_SIG_HEADER in verify_output
-                or "ssh signature" in verify_output.lower()
-                or 'Good "git" signature' in verify_output
-            ):
-                # SSH signature
-                return await self._parse_ssh_signature(tag_name, verify_output)
-            else:
-                # Unknown signature type
-                logger.warning(f"Unknown signature type for tag {tag_name}")
-                return SignatureInfo(
-                    type="invalid",
-                    verified=False,
-                    signature_data=verify_output,
-                )
-
         except Exception as e:
             logger.error(f"Failed to detect signature on tag {tag_name}: {e}")
             raise SignatureDetectionError(
                 f"Signature detection failed for tag {tag_name}: {e}"
             ) from e
+
+    @staticmethod
+    def _default_home() -> Path | None:
+        """Return the caller's GNUPGHOME as an absolute path, if set.
+
+        git runs gpg in the repository and the expiry lookup runs in the
+        caller's directory, so a relative home would name two keyrings.
+        """
+        home = os.environ.get("GNUPGHOME")
+        return Path(os.path.abspath(home)) if home else None
+
+    async def _detect_signature_with_home(
+        self,
+        tag_name: str,
+        gnupg_home: Path | None,
+        permit_expired_key: bool,
+        key_source: str,
+    ) -> SignatureInfo:
+        """Run git verify-tag against a GnuPG home and parse the result."""
+        command = ["git"]
+        if gnupg_home is not None or permit_expired_key:
+            # A configured gpg.program wrapper could read another keyring,
+            # so supplied-key runs verify with the gpg that imported them,
+            # and expired-key runs with the gpg that reads key expiry.
+            gpg = gpg_executable()
+            command += ["-c", f"gpg.program={gpg}", "-c", f"gpg.openpgp.program={gpg}"]
+        result = run_git(
+            [*command, "verify-tag", "--raw", tag_name],
+            cwd=self.repo_path,
+            check=False,  # Don't raise on non-zero exit (unsigned tags)
+            env_overrides=({"GNUPGHOME": str(gnupg_home)} if gnupg_home else None),
+        )
+
+        # Git writes signature info to stderr
+        verify_output = result.stderr
+        # GPG status lines carry the signer's user ID, so text matches on
+        # the whole output apply only when GnuPG reported nothing.
+        gpg_reported = bool(self._gpg_status_keywords(verify_output))
+
+        # Check if tag has a signature
+        if not verify_output or (
+            not gpg_reported and "no signature found" in verify_output.lower()
+        ):
+            logger.debug(f"Tag {tag_name} is unsigned")
+            return SignatureInfo(
+                type="unsigned",
+                verified=False,
+            )
+
+        # Check for SSH signature configuration error
+        if (
+            not gpg_reported
+            and "gpg.ssh.allowedSignersFile needs to be configured" in verify_output
+        ):
+            logger.debug("SSH signature detected but allowedSignersFile not configured")
+            # Still try to parse SSH signature from tag object
+            return await self._parse_ssh_signature(tag_name, verify_output)
+
+        gpg_info = await self._parse_gpg_output(
+            tag_name, verify_output, gnupg_home, permit_expired_key
+        )
+        if gpg_info is not None:
+            sourced: SignatureInfo = gpg_info.model_copy(
+                update={"key_source": key_source}
+            )
+            return sourced
+
+        if not gpg_reported and (
+            self.SSH_SIG_HEADER in verify_output
+            or "ssh signature" in verify_output.lower()
+            or 'Good "git" signature' in verify_output
+        ):
+            # SSH signature
+            return await self._parse_ssh_signature(tag_name, verify_output)
+
+        # Unknown signature type
+        logger.warning(f"Unknown signature type for tag {tag_name}")
+        return SignatureInfo(
+            type="invalid",
+            verified=False,
+            signature_data=verify_output,
+        )
 
     async def get_tag_object_content(self, tag_name: str) -> str:
         """

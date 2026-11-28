@@ -10,6 +10,7 @@ tag, and reports the outcome to the console, a JSON file and the GitHub
 step summary.
 """
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -113,16 +114,55 @@ async def _run_workflow(
         raise
 
 
+def _warn_expired_key(result: Any) -> None:
+    """Print a GitHub Actions warning when an expired key was let through.
+
+    Written to stderr, so the annotation also appears with ``--json``
+    without disturbing the JSON on stdout.
+    """
+    signature = result.signature_info
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not (
+        signature and signature.key_expired
+    ):
+        return
+    typer.echo(
+        f"::warning::GPG signing key {signature.primary_fingerprint} expired "
+        f"on {signature.key_expiry}; signature accepted by permit_expired_key",
+        err=True,
+    )
+
+
+GPG_KEY_DETAILS_ENV = "TAG_VALIDATE_GPG_KEY_DETAILS"
+
+
+def _report_gpg_key_details(options: VerifyOptions) -> bool:
+    """Whether the JSON reports the GPG key fields.
+
+    They appear when a GPG trust option is set, or when the caller asks
+    through the environment, as the action does; otherwise the JSON
+    keeps its earlier shape.
+    """
+    return bool(
+        options.trusted_gpg_keys is not None
+        or options.require_fingerprint is not None
+        or options.permit_expired_key
+        or os.environ.get(GPG_KEY_DETAILS_ENV) == "true"
+    )
+
+
 def _emit_verify_results(result: Any, workflow: Any, options: VerifyOptions) -> None:
     """Render the validation result to every requested destination."""
+    _warn_expired_key(result)
+    gpg_key_details = _report_gpg_key_details(options)
+
     if options.json_output:
-        console.print_json(data=build_console_output(result))
+        console.print_json(data=build_console_output(result, gpg_key_details))
     else:
         display_validation_result(result, workflow)
 
     # Write JSON to file if requested
     if options.json_file:
-        write_json_file(options.json_file, build_file_output(result))
+        write_json_file(options.json_file, build_file_output(result, gpg_key_details))
 
     # Write GitHub step summary if enabled and in GitHub Actions
     if options.github_step_summary and not options.json_output:

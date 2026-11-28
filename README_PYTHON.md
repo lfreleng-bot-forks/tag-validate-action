@@ -188,6 +188,15 @@ tag-validate verify <tag-location> [OPTIONS]
   `calver`, `both` (comma or space-separated for multiple)
 - `--require-signed TYPE[,TYPE...]` - Require tag signature: `gpg`, `ssh`,
   `gpg-unverifiable`, `unsigned` (comma or space-separated for multiple)
+- `--trusted-gpg-keys FILE` - Verify GPG signatures against the ASCII-armoured
+  public keys in FILE alone, in a temporary keyring; the default keyring is
+  neither read nor changed. FILE must not hold a secret key
+- `--require-fingerprint FPR[,FPR...]` - Require a verified GPG signature from
+  one of these 40-digit primary key fingerprints or their subkeys (comma or
+  space-separated). Fails for any other signature state; key IDs are refused
+- `--permit-expired-key` - Count a good GPG signature made before its key
+  expired as verified (revoked keys and later signatures still fail). Verifies
+  with the `gpg` on `PATH`, ignoring `gpg.program`
 - `--skip-version-validation` - Skip version format validation (only check signature)
 - `--require-github` - Verify signing key is registered to a GitHub account
 - `--require-owner OWNER[,OWNER...]` - GitHub username(s) or email(s) that must
@@ -237,6 +246,11 @@ tag-validate verify v1.2.3-beta --reject-development
 
 # JSON output for automation
 tag-validate verify v1.2.3 --json | jq '.success'
+
+# Require a signature from a pinned release key, verified against
+# the supplied public key only
+tag-validate verify v1.2.3 --trusted-gpg-keys release-key.asc \
+  --require-fingerprint 63DDFF3B52B3F1AD3709C15144931D585CCBDA33
 
 # Require any GPG signature (even unverifiable)
 tag-validate verify v1.2.3 --require-signed "gpg,gpg-unverifiable"
@@ -434,6 +448,13 @@ Machine-readable JSON for automation:
   ]
 }
 ```
+
+With `--trusted-gpg-keys`, `--require-fingerprint` or `--permit-expired-key`,
+`signature_details` of `verify` also carries `primary_fingerprint` (the
+primary key behind the signature), `key_source` (`supplied` or `keyring`)
+and `key_expired` (`true` when `--permit-expired-key` admitted an expired
+key). Set `TAG_VALIDATE_GPG_KEY_DETAILS=true` to report them without those
+options, as the action does; otherwise the JSON keeps its earlier shape.
 
 ## Programmatic Usage
 
